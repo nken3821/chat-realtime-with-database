@@ -1,0 +1,12 @@
+[package]
+name = "chat-realtime-with-database"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+dotenvy = "0.15.7"
+ws = { package = "rocket_ws", version = "0.1.1" }
+tokio = { version = "1", features = ["sync"] }
+rocket = { version = "0.5.1", features = ["json"] }
+uuid = { version = "1.26.1", features = ["v4"] }
