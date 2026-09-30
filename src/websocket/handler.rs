@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use rocket::{get, State};
-use rocket::futures::SinkExt;
+use rocket::futures::{SinkExt, StreamExt};
 use rocket::serde::json::serde_json;
 use tokio::sync::{mpsc, RwLock};
 use ws::{Channel, WebSocket};
 use uuid::Uuid;
 use crate::chat::room::{Client, RoomManager};
-use crate::models::message::ChatMessage;
+use crate::models::message::{self, ChatMessage, IncomingMessage, MessageType};
 
 #[get("/ws/<room_id>/<user_name>")]
 pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<Arc<RwLock<RoomManager>>>) -> Channel<'static> {
@@ -105,9 +105,227 @@ pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<
             // =========================================
             loop {
                 tokio::select! {
+                    // =================================
+                    // 1. Client -> Server
+                    // =================================
+                    message = stream.next() => {
+                        match message {
+                            Some(Ok(message)) => {
+                                println!(
+                                        "[Room:{}] [{}] Received: {:?}",
+                                        room_id,
+                                        user_name,
+                                        message
+                                );
+                                if let Ok(text) = message.to_text() {
+                                    match serde_json::from_str::<IncomingMessage>(text) {
+                                        Ok(incoming) => {
+                                            // =================================
+                                            // Validate content
+                                            // =================================
+                                            if incoming.content.trim().is_empty() {
+                                                println!(
+                                                        "[Room: {}] Empty message rejected",
+                                                        room_id
+                                                );
+                                                continue;
+                                            }
+
+                                            // =================================
+                                            // Handle message type
+                                            // =================================
+                                            match incoming.message_type {
+                                                // =================================
+                                                // Normal room message
+                                                // =================================
+                                                MessageType::Message => {
+                                                    let chat_message = ChatMessage {
+                                                        message_type: "message".to_string(),
+                                                        content: incoming.content,
+                                                        username: user_name.clone(),
+                                                        users: Vec::new(),
+                                                        to: None,
+                                                    };
+
+                                                    // =================================
+                                                    // Save to history
+                                                    // =================================
+                                                    {
+                                                        let mut manager = manager.write().await;
+                                                        if let Some(room) = manager.rooms.get_mut(&room_id) {
+                                                            room.history.push_back(
+                                                                chat_message.clone()
+                                                            );
+
+                                                            if room.history.len() > 50 {
+                                                                room.history.pop_front();
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // =================================
+                                                    // Broadcast to room
+                                                    // =================================
+                                                    let _ = sender.send(chat_message);
+                                                }
+                                                // =================================
+                                                // Private message
+                                                // =================================
+                                                MessageType::PrivateMessage => {
+                                                    let target_username = match incoming.to {
+                                                        Some(username) => username,
+                                                        None => {
+                                                            println!(
+                                                                "[Room: {}] Private message missing target",
+                                                                room_id
+                                                            );
+                                                            continue;
+                                                        }
+                                                    };
+
+                                                    // =================================
+                                                    // Find ALL connections of target user
+                                                    // =================================
+                                                    let target_senders = {
+                                                        let manager = manager.write().await;
+                                                        manager.rooms
+                                                            .get(&room_id)
+                                                            .map(|room| {
+                                                                room.clients.values().filter(|client| {
+                                                                    client.username == target_username
+                                                                })
+                                                                    .map(|client| {
+                                                                        client.sender.clone()
+                                                                    })
+                                                                    .collect::<Vec<_>>()
+                                                            })
+                                                            .unwrap_or_default()
+                                                    };
+
+                                                    // =================================
+                                                    // Create private message
+                                                    // =================================
+                                                    let private_message = ChatMessage {
+                                                        message_type: "private_message".to_string(),
+                                                        username: user_name.clone(),
+                                                        content: incoming.content,
+                                                        users: Vec::new(),
+                                                        to: Some(target_username.clone())
+                                                    };
+
+                                                    // =================================
+                                                    // Send to all target connections
+                                                    // =================================
+                                                    for target_sender in target_senders {
+                                                        let _ = target_sender.send(private_message.clone());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            println!(
+                                                "[Room: {}] Invalid JSON: {}",
+                                                room_id,
+                                                error
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Err(error)) => {
+                                println!(
+                                    "[Room: {}] WebSocket error: {}",
+                                    room_id,
+                                    error
+                                );
+                                break;
+                            }
+                            None => {
+                                println!(
+                                    "[Room: {}] [{}] Client disconnected",
+                                    room_id,
+                                    user_name
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    // =================================
+                    // 2. Room broadcast -> Client
+                    // =================================
+                    message = receiver.recv() => {
+                        match message {
+                            Ok(chat_message) => {
+                                match serde_json::to_string(&chat_message) {
+                                    Ok(json) => {
+                                        if let Err(error) = stream.send(json.into()).await {
+                                            println!("[Room: {}] Send error: {}", room_id, error);
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        println!("[Room: {}] Serialization error: {}", room_id, error);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                println!("[Room: {}] Broadcast error: {}", room_id, error);
+                                break;
+                            }
+                        }
+                    }
+
+                    // =================================
+                    // 3. Private message -> Client
+                    // =================================
+                    Some(private_message) = private_receiver.recv() => {
+                        match serde_json::to_string(&private_message) {
+                            Ok(json) => {
+                                if let Err(error) = stream.send(json.into()).await {
+                                    println!("[Room: {}] Private send error: {}", room_id, error);
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                println!("[Room: {}] Private serialization error: {}", room_id, error);
+                            }
+                        }
+                    }
 
                 }
             }
+            // =========================================
+            // Remove client from room
+            // =========================================
+            let users = {
+                let mut manager = manager.write().await;
+                if let Some(room) = manager.rooms.get_mut(&room_id) {
+                    room.clients.remove(&connection_id);
+                    room.clients
+                        .values()
+                        .map(|client| client.username.clone())
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                }
+                else {
+                    Vec::new()
+                }
+            };
+
+            // =========================================
+            // Notify room about LEAVE
+            // =========================================
+            let _ = sender.send(ChatMessage {
+                message_type: "leave".to_string(),
+                username: user_name.clone(),
+                content: String::new(),
+                users,
+                to: None
+            });
+
+            Ok(())
         })
     })
 }

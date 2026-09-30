@@ -20,5 +20,5 @@ pub enum MessageType {
 pub struct IncomingMessage {
     pub message_type: MessageType,
     pub content: String,
-    pub to: String
+    pub to: Option<String>
 }
