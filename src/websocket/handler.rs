@@ -1,16 +1,20 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-use rocket::{get, State};
+use crate::chat::room::{RoomManager};
+use crate::models::message::{ChatMessage, IncomingMessage, ServerMessageType, ClientMessageTye};
 use rocket::futures::{SinkExt, StreamExt};
 use rocket::serde::json::serde_json;
-use tokio::sync::{mpsc, RwLock};
-use ws::{Channel, WebSocket};
+use rocket::{State, get};
+use std::sync::Arc;
+use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
-use crate::chat::room::{Client, RoomManager};
-use crate::models::message::{self, ChatMessage, IncomingMessage, MessageType};
+use ws::{Channel, WebSocket};
 
 #[get("/ws/<room_id>/<user_name>")]
-pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<Arc<RwLock<RoomManager>>>) -> Channel<'static> {
+pub fn websocket(
+    ws: WebSocket,
+    room_id: &str,
+    user_name: &str,
+    manager: &State<Arc<RwLock<RoomManager>>>,
+) -> Channel<'static> {
     let connection_id = Uuid::new_v4().to_string();
     let manager = manager.inner().clone();
     let room_id = room_id.to_string();
@@ -28,29 +32,21 @@ pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<
             // =========================================
             let (sender, users, history) = {
                 let mut manager = manager.write().await;
-                let room = manager.get_or_create_room(&room_id);
+                let sender = {
+                    let room = manager.get_or_create_room(&room_id);
+                    room.sender.clone()
+                };
 
-                room.clients.insert(
-                    connection_id.clone(),
-                    Client {
-                        username: user_name.clone(),
-                        sender: private_sender
-                    }
-                );
+                manager.add_client(&room_id, connection_id.clone(), user_name.clone(), private_sender);
 
                 // =========================================
                 // Online user
                 // =========================================
-                let users = room.clients
-                    .values()
-                    .map(|client| client.username.clone())
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                let users = manager.get_online_users(&room_id);
 
-                let history = room.history.iter().cloned().collect::<Vec<_>>();
+                let history = manager.get_history(&room_id);
 
-                (room.sender.clone(), users, history)
+                (sender, users, history)
             };
 
             // =========================================
@@ -77,7 +73,7 @@ pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<
             // =========================================
             let _ = sender.send(
                 ChatMessage {
-                    message_type: "join".to_string(),
+                    message_type: ServerMessageType::Join,
                     username: user_name.clone(),
                     content: String::new(),
                     users: users.clone(),
@@ -89,7 +85,7 @@ pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<
             // Send current users only to this client
             // =========================================
             let user_manager = ChatMessage {
-                message_type: "users".to_string(),
+                message_type: ServerMessageType::Users,
                 username: String::new(),
                 content: String::new(),
                 users,
@@ -138,9 +134,9 @@ pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<
                                                 // =================================
                                                 // Normal room message
                                                 // =================================
-                                                MessageType::Message => {
+                                                ClientMessageTye::Message => {
                                                     let chat_message = ChatMessage {
-                                                        message_type: "message".to_string(),
+                                                        message_type: ServerMessageType::Message,
                                                         content: incoming.content,
                                                         username: user_name.clone(),
                                                         users: Vec::new(),
@@ -152,16 +148,8 @@ pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<
                                                     // =================================
                                                     {
                                                         let mut manager = manager.write().await;
-                                                        if let Some(room) = manager.rooms.get_mut(&room_id) {
-                                                            room.history.push_back(
-                                                                chat_message.clone()
-                                                            );
-
-                                                            if room.history.len() > 50 {
-                                                                room.history.pop_front();
-                                                            }
-                                                        }
-                                                    }
+                                                        manager.add_history(&room_id, chat_message.clone());
+                                                    }   
 
                                                     // =================================
                                                     // Broadcast to room
@@ -171,7 +159,7 @@ pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<
                                                 // =================================
                                                 // Private message
                                                 // =================================
-                                                MessageType::PrivateMessage => {
+                                                ClientMessageTye::PrivateMessage => {
                                                     let target_username = match incoming.to {
                                                         Some(username) => username,
                                                         None => {
@@ -187,26 +175,15 @@ pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<
                                                     // Find ALL connections of target user
                                                     // =================================
                                                     let target_senders = {
-                                                        let manager = manager.write().await;
-                                                        manager.rooms
-                                                            .get(&room_id)
-                                                            .map(|room| {
-                                                                room.clients.values().filter(|client| {
-                                                                    client.username == target_username
-                                                                })
-                                                                    .map(|client| {
-                                                                        client.sender.clone()
-                                                                    })
-                                                                    .collect::<Vec<_>>()
-                                                            })
-                                                            .unwrap_or_default()
+                                                        let manager = manager.read().await;
+                                                        manager.get_client_sender(&room_id, &target_username)
                                                     };
 
                                                     // =================================
                                                     // Create private message
                                                     // =================================
                                                     let private_message = ChatMessage {
-                                                        message_type: "private_message".to_string(),
+                                                        message_type: ServerMessageType::PrivateMessage,
                                                         username: user_name.clone(),
                                                         content: incoming.content,
                                                         users: Vec::new(),
@@ -300,25 +277,14 @@ pub fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<
             // =========================================
             let users = {
                 let mut manager = manager.write().await;
-                if let Some(room) = manager.rooms.get_mut(&room_id) {
-                    room.clients.remove(&connection_id);
-                    room.clients
-                        .values()
-                        .map(|client| client.username.clone())
-                        .collect::<HashSet<_>>()
-                        .into_iter()
-                        .collect::<Vec<_>>()
-                }
-                else {
-                    Vec::new()
-                }
+                manager.remove_client_and_cleanup(&room_id, &connection_id)
             };
 
             // =========================================
             // Notify room about LEAVE
             // =========================================
             let _ = sender.send(ChatMessage {
-                message_type: "leave".to_string(),
+                message_type: ServerMessageType::Leave,
                 username: user_name.clone(),
                 content: String::new(),
                 users,
