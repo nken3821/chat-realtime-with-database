@@ -6,7 +6,7 @@ pub struct ChatMessage {
     pub content: String,
     pub username: String,
     pub users: Vec<String>,
-    pub to: Option<String>,
+    pub to: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -16,7 +16,8 @@ pub enum ServerMessageType {
     PrivateMessage,
     Join,
     Leave,
-    Users
+    Users,  
+    Error
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -30,5 +31,5 @@ pub enum ClientMessageTye {
 pub struct IncomingMessage {
     pub message_type: ClientMessageTye,
     pub content: String,
-    pub to: Option<String>,
+    pub to: Option<i32>,
 }
