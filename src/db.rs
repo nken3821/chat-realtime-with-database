@@ -1,6 +1,7 @@
-use diesel::{MysqlConnection, r2d2::{ConnectionManager, Pool}};
-
-
+use diesel::{
+    MysqlConnection,
+    r2d2::{ConnectionManager, Pool},
+};
 
 pub type DbPool = Pool<ConnectionManager<MysqlConnection>>;
 

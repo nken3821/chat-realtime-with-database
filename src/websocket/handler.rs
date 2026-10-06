@@ -1,6 +1,7 @@
 use crate::auth::user_identity::find_user_identity;
 use crate::chat::room::{ RoomManager };
 use crate::db::DbPool;
+use crate::models::message::MessageWithUsername;
 use crate::models::{
     ChatMessage, 
     IncomingMessage, 
@@ -8,7 +9,8 @@ use crate::models::{
     ClientMessageTye, 
     AuthenticationMessage 
 };
-use crate::auth::{user_identity, verify_token};
+use crate::repositories::message;
+use crate::auth::{verify_token};
 use rocket::futures::{ SinkExt, StreamExt };
 use rocket::serde::json::serde_json;
 use rocket::{ State, get };
@@ -25,6 +27,16 @@ fn error_message(content: impl Into<String>) -> ChatMessage {
         username: String::new(),
         users: Vec::new(),
         to: None,
+    }
+}
+
+fn message_to_chat_message(message: MessageWithUsername) -> ChatMessage {
+    ChatMessage {
+        message_type: ServerMessageType::Message,
+        content: message.content,
+        username: message.username,
+        users: Vec::new(),
+        to: None
     }
 }
 
@@ -175,7 +187,7 @@ pub fn websocket(
             // =========================================
             // Join room
             // =========================================
-            let (sender, users, history) = {
+            let (sender, users) = {
                 let mut manager = manager.write().await;
                 let sender = {
                     let room = manager.get_or_create_room(&room_id);
@@ -195,9 +207,8 @@ pub fn websocket(
                 // =========================================
                 let users = manager.get_online_users(&room_id);
 
-                let history = manager.get_history(&room_id);
 
-                (sender, users, history)
+                (sender, users)
             };
 
             // =========================================
@@ -205,8 +216,30 @@ pub fn websocket(
             // =========================================
             let mut receiver = sender.subscribe();
 
-            for history_manager in history {
-                match serde_json::to_string(&history_manager) {
+            // =========================================
+            // Load message history from database
+            // =========================================
+            let history = match db.get() {
+                Ok(mut connection) => {
+                    match message::get_history(&mut connection, &room_id) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            println!("[Room: {}] Database connection error while loading history {}", room_id, error);
+                            Vec::new()        
+                        }       
+                    }
+                }
+                Err(error) => {
+                    println!("[Room: {}] Database connection error while loading history: {}", room_id, error);
+
+                    Vec::new()
+                }
+            };
+
+            for history_message in history {
+                let chat_message = message_to_chat_message(history_message);
+
+                match serde_json::to_string(&chat_message) {
                     Ok(json) => {
                         if let Err(error) = stream.send(json.into()).await {
                             println!("[Room: {}] History send error: {}", room_id, error);
@@ -291,6 +324,54 @@ pub fn websocket(
                                                 // Normal room message
                                                 // =================================
                                                 ClientMessageTye::Message => {
+                                                    // =================================
+                                                    // Save message to database
+                                                    // =================================
+                                                    let saved_message = {
+                                                        let mut connection = match db.get() {
+                                                            Ok(connection) => connection,
+                                                            Err(error) => {
+                                                                println!(
+                                                                    "[Room: {}] Database connection error: {}",room_id, error
+                                                                );
+
+                                                                let response = error_message("Database connection failed");
+
+                                                                if let Ok(json) = serde_json::to_string(&response) {
+                                                                    let _ = stream.send(json.into()).await;
+                                                                }
+
+                                                                    continue;
+                                                            }
+                                                        };
+
+                                                        match message::create(&mut connection, &room_id, user_id, &incoming.content) {
+                                                            Ok(message) => message,
+
+                                                            Err(error) => {
+                                                                println!("[Room: {}] Failed to save message: {}",room_id, error);
+
+                                                                let response = error_message("Failed to save message");
+
+                                                                if let Ok(json) = serde_json::to_string(&response) {
+                                                                    let _ = stream.send(json.into()).await;
+                                                                }
+
+                                                                continue;
+                                                            }
+                                                        }
+                                                    };
+
+                                                    println!(
+                                                        "[Room: {}] Message saved to database with id: {}",
+                                                        room_id,
+                                                        saved_message.id
+                                                    );
+
+                                                    // =================================
+                                                    // Create WebSocket message
+                                                    // =================================
+
                                                     let chat_message = ChatMessage {
                                                         message_type: ServerMessageType::Message,
                                                         content: incoming.content,
@@ -410,7 +491,7 @@ pub fn websocket(
                     message = receiver.recv() => {
                         match message {
                             Ok(chat_message) => {
-                                match serde_json::to_string(&chat_message) {
+                            match serde_json::to_string(&chat_message) {
                                     Ok(json) => {
                                         if let Err(error) = stream.send(json.into()).await {
                                             println!("[Room: {}] Send error: {}", room_id, error);

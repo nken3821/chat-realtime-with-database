@@ -11,4 +11,6 @@ tokio = { version = "1", features = ["sync"] }
 rocket = { version = "0.5.1", features = ["json"] }
 uuid = { version = "1.26.1", features = ["v4"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
-diesel = { version = "2.3.13", features = ["mysql", "r2d2"] }
+diesel = { version = "2.3.13", features = ["mysql", "r2d2", "chrono"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+
