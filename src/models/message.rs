@@ -2,7 +2,7 @@ use crate::schema::messages;
 use chrono::NaiveDateTime;
 use diesel::{
     Insertable, Selectable,
-    deserialize::{Queryable, QueryableByName},
+    deserialize::{Queryable},
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ pub struct NewMessage<'a> {
     pub content: &'a str,
 }
 
-#[derive(Debug, Queryable)]
+#[derive(Debug, Queryable, Serialize)]
 pub struct MessageWithUsername {
     pub id: i32,
     pub room_id: String,
@@ -37,11 +37,14 @@ pub struct MessageWithUsername {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
+    pub id: Option<i32>,
     pub message_type: ServerMessageType,
     pub content: String,
     pub username: String,
     pub users: Vec<String>,
     pub to: Option<i32>,
+    pub created_at: Option<String>,
+    pub has_more: Option<bool>
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -53,6 +56,7 @@ pub enum ServerMessageType {
     Leave,
     Users,
     Error,
+    History
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -60,6 +64,7 @@ pub enum ServerMessageType {
 pub enum ClientMessageTye {
     Message,
     PrivateMessage,
+    LoadHistory
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,4 +72,5 @@ pub struct IncomingMessage {
     pub message_type: ClientMessageTye,
     pub content: String,
     pub to: Option<i32>,
+    pub before_id: Option<i32>
 }

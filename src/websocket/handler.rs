@@ -11,6 +11,8 @@ use crate::models::{
 };
 use crate::repositories::message;
 use crate::auth::{verify_token};
+use crate::models::HistoryResponse;
+use crate::repositories::HistoryPage;
 use rocket::futures::{ SinkExt, StreamExt };
 use rocket::serde::json::serde_json;
 use rocket::{ State, get };
@@ -20,23 +22,38 @@ use tokio::sync::{ RwLock, mpsc };
 use uuid::Uuid;
 use ws::{ Channel, WebSocket };
 
+fn history_response(page: HistoryPage) -> HistoryResponse {
+    HistoryResponse {
+        message_type: "history",
+        messages: page.messages,
+        has_more: page.has_more,
+        oldest_id: page.oldest_id,
+    }
+}
+
 fn error_message(content: impl Into<String>) -> ChatMessage {
     ChatMessage {
+        id: None,
         message_type: ServerMessageType::Error,
         content: content.into(),
         username: String::new(),
         users: Vec::new(),
         to: None,
+        created_at: None,
+        has_more: None
     }
 }
 
 fn message_to_chat_message(message: MessageWithUsername) -> ChatMessage {
     ChatMessage {
+        id: Some(message.id),
         message_type: ServerMessageType::Message,
         content: message.content,
         username: message.username,
         users: Vec::new(),
-        to: None
+        to: None,
+        created_at: Some(message.created_at.to_string()),
+        has_more: None
     }
 }
 
@@ -144,7 +161,7 @@ pub fn websocket(
                         println!(
                             "[Room: {}] Database connection error: {}",
                             room_id,
-                            error
+                            error       
                         );
                         return Ok(());
                     }
@@ -219,36 +236,49 @@ pub fn websocket(
             // =========================================
             // Load message history from database
             // =========================================
-            let history = match db.get() {
+            let history_page = match db.get() {
                 Ok(mut connection) => {
                     match message::get_history(&mut connection, &room_id) {
-                        Ok(message) => message,
+                        Ok(page) => page,
                         Err(error) => {
-                            println!("[Room: {}] Database connection error while loading history {}", room_id, error);
-                            Vec::new()        
-                        }       
+                            println!(
+                                "[Room: {}] Failed to load history: {}",
+                                room_id,
+                                error
+                            );
+
+                            HistoryPage {
+                                messages: Vec::new(),
+                                has_more: false,
+                                oldest_id: None,
+                            }
+                        }
                     }
                 }
                 Err(error) => {
-                    println!("[Room: {}] Database connection error while loading history: {}", room_id, error);
+                    println!(
+                        "[Room: {}] Database connection error: {}",
+                        room_id,
+                        error
+                    );
 
-                    Vec::new()
+                    HistoryPage {
+                        messages: Vec::new(),
+                        has_more: false,
+                        oldest_id: None,
+                    }
                 }
             };
 
-            for history_message in history {
-                let chat_message = message_to_chat_message(history_message);
+            let response = history_response(history_page);
 
-                match serde_json::to_string(&chat_message) {
-                    Ok(json) => {
-                        if let Err(error) = stream.send(json.into()).await {
-                            println!("[Room: {}] History send error: {}", room_id, error);
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        println!("[Room: {}] History serialization error: {}", room_id, error);
-                    }
+            if let Ok(json) = serde_json::to_string(&response) {
+                if let Err(error) = stream.send(json.into()).await {
+                    println!(
+                        "[Room: {}] Failed to send history: {}",
+                        room_id,
+                        error
+                    );
                 }
             }
 
@@ -256,22 +286,28 @@ pub fn websocket(
             // Notify room that user joined
             // =========================================
             let _ = sender.send(ChatMessage {
+                id: None,
                 message_type: ServerMessageType::Join,
                 username: user_name.clone(),
                 content: String::new(),
                 users: users.clone(),
                 to: None,
+                created_at: None,
+                has_more: None
             });
 
             // =========================================
             // Send current users only to this client
             // =========================================
             let user_manager = ChatMessage {
+                id: None,
                 message_type: ServerMessageType::Users,
                 username: String::new(),
                 content: String::new(),
                 users,
                 to: None,
+                created_at: None,
+                has_more: None
             };
 
             if let Ok(json) = serde_json::to_string(&user_manager) {
@@ -373,20 +409,15 @@ pub fn websocket(
                                                     // =================================
 
                                                     let chat_message = ChatMessage {
+                                                        id: Some(saved_message.id),
                                                         message_type: ServerMessageType::Message,
                                                         content: incoming.content,
                                                         username: user_name.clone(),
                                                         users: Vec::new(),
                                                         to: None,
+                                                        created_at: Some(saved_message.created_at.to_string()),
+                                                        has_more: None
                                                     };
-
-                                                    // =================================
-                                                    // Save to history
-                                                    // =================================
-                                                    {
-                                                        let mut manager = manager.write().await;
-                                                        manager.add_history(&room_id, chat_message.clone());
-                                                    }   
 
                                                     // =================================
                                                     // Broadcast to room
@@ -434,11 +465,14 @@ pub fn websocket(
                                                     // Create private message
                                                     // =================================
                                                     let private_message = ChatMessage {
+                                                        id: None,
                                                         message_type: ServerMessageType::PrivateMessage,
                                                         username: user_name.clone(),
                                                         content: incoming.content,
                                                         users: Vec::new(),
-                                                        to: Some(target_user_id)
+                                                        to: Some(target_user_id),
+                                                        created_at: None,
+                                                        has_more: None
                                                     };
 
                                                     // =================================
@@ -447,6 +481,80 @@ pub fn websocket(
                                                     for target_sender in target_senders {
                                                         let _ = target_sender.send(private_message.clone());
                                                     }
+                                                }
+
+                                                // =================================
+                                                // History message
+                                                // =================================
+                                                ClientMessageTye::LoadHistory => {
+                                                    let before_id = match incoming.before_id {
+                                                        Some(id) => id,
+                                                        None => {
+                                                            let reponse = error_message("Load history requires before_id");
+                                                            if let Ok(json) = serde_json::to_string(&reponse) {
+                                                                let _ = stream.send(json.into()).await;
+                                                            }
+                                                            continue;
+                                                        }
+                                                    };
+                                                    
+                                                    let history_page = match db.get() {
+                                                        Ok(mut connection) => {
+                                                            match message::get_history_before(
+                                                                &mut connection,
+                                                                &room_id,
+                                                                before_id,
+                                                            ) {
+                                                                Ok(page) => page,
+                                                                Err(error) => {
+                                                                    println!(
+                                                                        "[Room: {}] Failed to load older history: {}",
+                                                                        room_id,
+                                                                        error
+                                                                    );
+
+                                                                    let response =
+                                                                        error_message("Failed to load message history");
+
+                                                                    if let Ok(json) = serde_json::to_string(&response) {
+                                                                        let _ = stream.send(json.into()).await;
+                                                                    }
+
+                                                                    continue;
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(error) => {
+                                                            println!(
+                                                                "[Room: {}] Database connection error: {}",
+                                                                room_id,
+                                                                error
+                                                            );
+
+                                                            let response =
+                                                                error_message("Database connection failed");
+
+                                                            if let Ok(json) = serde_json::to_string(&response) {
+                                                                let _ = stream.send(json.into()).await;
+                                                            }
+
+                                                            continue;
+                                                        }
+                                                    };
+
+                                                    let response = history_response(history_page);
+
+                                                    if let Ok(json) = serde_json::to_string(&response) {
+                                                        if let Err(error) = stream.send(json.into()).await {
+                                                            println!(
+                                                                "[Room: {}] Failed to send older history: {}",
+                                                                room_id,
+                                                                error
+                                                            );
+                                                            break;
+                                                        }
+                                                    }
+
                                                 }
                                             }
                                         }
@@ -542,11 +650,14 @@ pub fn websocket(
             // =========================================
             if should_notify_leave.user_left {
                 let _ = sender.send(ChatMessage {
-                message_type: ServerMessageType::Leave,
-                username: user_name.clone(),
-                content: String::new(),
-                users: should_notify_leave.users,
-                to: None,
+                    id: None,
+                    message_type: ServerMessageType::Leave,
+                    username: user_name.clone(),
+                    content: String::new(),
+                    users: should_notify_leave.users,
+                    to: None,
+                    created_at: None,
+                    has_more: None
                 });
             }
 

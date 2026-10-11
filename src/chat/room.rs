@@ -1,5 +1,5 @@
 use crate::models::message::ChatMessage;
-use std::{collections::{ HashMap, HashSet, VecDeque }, str};
+use std::{collections::{ HashMap, HashSet }, str};
 use tokio::sync::{ broadcast, mpsc };
 
 pub struct Client {
@@ -11,7 +11,6 @@ pub struct Client {
 pub struct Room {
     pub sender: broadcast::Sender<ChatMessage>,
     pub clients: HashMap<String, Client>,
-    pub history: VecDeque<ChatMessage>,
 }
 
 pub struct RoomManager {
@@ -37,19 +36,8 @@ impl RoomManager {
             Room {
                 sender,
                 clients: HashMap::new(),
-                history: VecDeque::new(),
             }
         })
-    }
-
-    pub fn add_history(&mut self, room_id: &str, message: ChatMessage) {
-        if let Some(room) = self.rooms.get_mut(room_id) {
-            room.history.push_back(message);
-
-            if room.history.len() > 50 {
-                room.history.pop_front();
-            }
-        }
     }
 
     pub fn get_online_users(&self, room_id: &str) -> Vec<String> {
@@ -80,13 +68,6 @@ impl RoomManager {
             username: username,
             sender: sender,
         });
-    }
-
-    pub fn get_history(&mut self, room_id: &str) -> Vec<ChatMessage> {
-        self.rooms
-            .get(room_id)
-            .map(|room| room.history.iter().cloned().collect())
-            .unwrap_or_default()
     }
 
     pub fn get_client_sender(
